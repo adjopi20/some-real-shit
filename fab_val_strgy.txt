@@ -1,0 +1,329 @@
+//@version=6
+strategy('Fabio Valentini Pro Scalper', overlay = true, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, initial_capital = 100000)
+
+// ============================================================================
+// FABIO VALENTINI PRO SCALPER
+// Order Flow Approximation for TradingView
+// Based on: Order Flow, Volume Absorption, Triple-A Setup, VWAP, Volume Profile
+// Inspired by Fabio Valentini's NASDAQ scalping methodology
+// Note: True order flow requires tick data. This approximates using volume analysis.
+// ============================================================================
+
+// === INPUTS ===
+// Session Settings
+sessionStart = input.session('0930-1600', 'Trading Session (NY)', group = 'Session')
+useSessionFilter = input.bool(true, 'Only Trade During Session', group = 'Session')
+
+// Volume Profile Settings
+vpLength = input.int(50, 'Volume Profile Lookback', minval = 10, group = 'Volume Profile')
+vpResolution = input.int(24, 'VP Row Resolution', minval = 10, maxval = 50, group = 'Volume Profile')
+
+// Absorption Detection
+absorbVolMult = input.float(2.0, 'Absorption Volume Multiplier', minval = 1.0, step = 0.1, group = 'Absorption')
+absorbPriceThresh = input.float(0.3, 'Absorption Max Price Move (ATR %)', minval = 0.1, step = 0.1, group = 'Absorption')
+
+// Delta Approximation
+deltaLookback = input.int(5, 'Delta Smoothing', minval = 1, group = 'Delta')
+
+// VWAP Settings
+useVWAP = input.bool(true, 'Use VWAP Filter', group = 'VWAP')
+vwapBand = input.float(0.5, 'VWAP Band (ATR Multiplier)', minval = 0.1, group = 'VWAP')
+
+// Risk Management (Fabio's Rules)
+riskPercent = input.float(1.0, 'Risk Per Trade (%)', minval = 0.1, maxval = 5.0, group = 'Risk')
+rrRatio = input.float(2.0, 'Risk:Reward Ratio', minval = 1.0, maxval = 5.0, group = 'Risk')
+maxDailyLosses = input.int(3, 'Max Losses Before Stop (Fabio\'s 3-stop rule)', minval = 1, maxval = 10, group = 'Risk')
+trailingStop = input.bool(true, 'Use Trailing Stop', group = 'Risk')
+trailATRMult = input.float(1.5, 'Trailing Stop ATR Multiplier', minval = 0.5, group = 'Risk')
+
+// ORB Settings
+orbMinutes = input.int(30, 'Opening Range Minutes', minval = 5, maxval = 60, group = 'ORB')
+useORB = input.bool(true, 'Use ORB Breakout', group = 'ORB')
+
+// Visual Settings
+showVALevels = input.bool(true, 'Show Value Area Levels', group = 'Visuals')
+showAbsorption = input.bool(true, 'Show Absorption Signals', group = 'Visuals')
+showDelta = input.bool(true, 'Show Delta Histogram', group = 'Visuals')
+
+// === CALCULATIONS ===
+
+// ATR for dynamic levels
+atr = ta.atr(14)
+
+// --- VWAP Calculation ---
+vwapValue = ta.vwap(hlc3)
+vwapUpper = vwapValue + atr * vwapBand
+vwapLower = vwapValue - atr * vwapBand
+
+// --- Session Detection ---
+inSession = not na(time(timeframe.period, sessionStart))
+sessionChange = inSession and not inSession[1]
+
+// --- Volume Profile Approximation (VAH, VAL, POC) ---
+// Simplified VP using highest volume price levels
+var float poc = na
+var float vah = na
+var float val = na
+
+// Calculate session high/low for VP boundaries
+sessionHigh = ta.highest(high, vpLength)
+sessionLow = ta.lowest(low, vpLength)
+priceRange = sessionHigh - sessionLow
+rowHeight = priceRange / vpResolution
+
+// Find POC (Point of Control) - price level with highest volume
+var array<float> volumeAtPrice = array.new_float(vpResolution, 0.0)
+
+if barstate.isconfirmed
+    // Reset on new calculation
+    for i = 0 to vpResolution - 1 by 1
+        array.set(volumeAtPrice, i, 0.0)
+
+    // Accumulate volume at price levels
+    for j = 0 to vpLength - 1 by 1
+        priceLevel = math.floor((close[j] - sessionLow) / rowHeight)
+        if priceLevel >= 0 and priceLevel < vpResolution
+            currentVol = array.get(volumeAtPrice, int(priceLevel))
+            array.set(volumeAtPrice, int(priceLevel), currentVol + volume[j])
+
+    // Find POC
+    maxVol = 0.0
+    pocIndex = 0
+    for i = 0 to vpResolution - 1 by 1
+        if array.get(volumeAtPrice, i) > maxVol
+            maxVol := array.get(volumeAtPrice, i)
+            pocIndex := i
+            pocIndex
+
+    poc := sessionLow + pocIndex * rowHeight + rowHeight / 2
+
+    // Calculate Value Area (70% of volume)
+    totalVol = array.sum(volumeAtPrice)
+    targetVol = totalVol * 0.7
+
+    accumulatedVol = array.get(volumeAtPrice, pocIndex)
+    vahIndex = pocIndex
+    valIndex = pocIndex
+
+    while accumulatedVol < targetVol and (vahIndex < vpResolution - 1 or valIndex > 0)
+        aboveVol = vahIndex < vpResolution - 1 ? array.get(volumeAtPrice, vahIndex + 1) : 0.0
+        belowVol = valIndex > 0 ? array.get(volumeAtPrice, valIndex - 1) : 0.0
+
+        if aboveVol >= belowVol and vahIndex < vpResolution - 1
+            vahIndex := vahIndex + 1
+            accumulatedVol := accumulatedVol + aboveVol
+            accumulatedVol
+        else if valIndex > 0
+            valIndex := valIndex - 1
+            accumulatedVol := accumulatedVol + belowVol
+            accumulatedVol
+        else
+            break
+
+    vah := sessionLow + vahIndex * rowHeight + rowHeight
+    val := sessionLow + valIndex * rowHeight
+    val
+
+// --- Delta Approximation (Buy vs Sell Pressure) ---
+// Approximate using candle body position and volume
+buyVolume = close > open ? volume : close == open ? volume * 0.5 : volume * ((high - close) / (high - low + 0.0001))
+sellVolume = volume - buyVolume
+
+delta = buyVolume - sellVolume
+smoothDelta = ta.sma(delta, deltaLookback)
+cumulativeDelta = ta.cum(delta)
+deltaMomentum = ta.change(cumulativeDelta, deltaLookback)
+
+// Delta control detection
+buyersControl = smoothDelta > 0 and smoothDelta > smoothDelta[1]
+sellersControl = smoothDelta < 0 and smoothDelta < smoothDelta[1]
+
+// --- Absorption Detection ---
+// High volume + small price movement = absorption (passive orders absorbing aggression)
+avgVolume = ta.sma(volume, 20)
+priceMove = math.abs(close - open) / atr
+highVolume = volume > avgVolume * absorbVolMult
+smallMove = priceMove < absorbPriceThresh
+
+absorption = highVolume and smallMove
+absorptionUp = absorption and close > open // Buyers absorbing selling
+absorptionDown = absorption and close < open // Sellers absorbing buying
+
+// Consecutive absorption detection (building wall)
+var int absorptionCount = 0
+if absorption
+    absorptionCount := absorptionCount + 1
+    absorptionCount
+else
+    absorptionCount := 0
+    absorptionCount
+
+strongAbsorption = absorptionCount >= 2
+
+// --- Triple-A Setup Detection ---
+// Absorption → Accumulation → Aggression
+// 1. Absorption: High volume, small move (detected above)
+// 2. Accumulation: Tight range, building positions
+// 3. Aggression: Breakout with volume
+
+// Accumulation detection (contraction)
+rangeSize = ta.highest(high, 10) - ta.lowest(low, 10)
+avgRange = ta.sma(rangeSize, 50)
+contraction = rangeSize < avgRange * 0.6
+
+// Aggression detection (expansion with volume)
+expansion = rangeSize > avgRange * 1.2 and volume > avgVolume * 1.5
+aggressiveBuy = expansion and close > open and smoothDelta > 0
+aggressiveSell = expansion and close < open and smoothDelta < 0
+
+// Triple-A Long: Absorption (buyers) → Contraction → Aggressive Break Up
+tripleALong = absorptionUp[3] or absorptionUp[4] or absorptionUp[5]
+tripleALongSetup = tripleALong and contraction[1] and aggressiveBuy
+
+// Triple-A Short: Absorption (sellers) → Contraction → Aggressive Break Down
+tripleAShort = absorptionDown[3] or absorptionDown[4] or absorptionDown[5]
+tripleAShortSetup = tripleAShort and contraction[1] and aggressiveSell
+
+// --- ORB (Opening Range Breakout) ---
+var float orbHigh = na
+var float orbLow = na
+var bool orbDefined = false
+
+if sessionChange
+    orbHigh := na
+    orbLow := na
+    orbDefined := false
+    orbDefined
+
+// Define ORB during first X minutes
+orbBars = orbMinutes / timeframe.in_seconds(timeframe.period) * 60
+sessionBars = ta.barssince(sessionChange)
+
+if inSession and sessionBars <= orbBars
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+    orbDefined := sessionBars == orbBars
+    orbDefined
+
+orbBreakoutLong = useORB and orbDefined and close > orbHigh and close[1] <= orbHigh
+orbBreakoutShort = useORB and orbDefined and close < orbLow and close[1] >= orbLow
+
+// --- Value Area Bounce Setup ---
+// Price at VAL with buyer absorption = Long opportunity
+// Price at VAH with seller absorption = Short opportunity
+atVAL = not na(val) and low <= val * 1.001 and low >= val * 0.999
+atVAH = not na(vah) and high >= vah * 0.999 and high <= vah * 1.001
+
+valBounce = atVAL and absorptionUp and buyersControl
+vahBounce = atVAH and absorptionDown and sellersControl
+
+// --- Combined Entry Signals ---
+// Long conditions (any of these with confirmation)
+longSignal = (tripleALongSetup or orbBreakoutLong or valBounce) and (not useVWAP or close > vwapLower)
+shortSignal = (tripleAShortSetup or orbBreakoutShort or vahBounce) and (not useVWAP or close < vwapUpper)
+
+// Session and risk filter
+sessionOK = not useSessionFilter or inSession
+
+// Daily loss counter
+var int dailyLosses = 0
+if sessionChange
+    dailyLosses := 0
+    dailyLosses
+
+canTrade = dailyLosses < maxDailyLosses
+
+// === STRATEGY EXECUTION ===
+if longSignal and sessionOK and canTrade and strategy.position_size == 0
+    stopLoss = low - atr
+    takeProfit = close + (close - stopLoss) * rrRatio
+
+    strategy.entry('Long', strategy.long)
+    strategy.exit('Long Exit', 'Long', stop = stopLoss, limit = takeProfit, trail_points = trailingStop ? atr * trailATRMult / syminfo.mintick : na, trail_offset = trailingStop ? atr * 0.5 / syminfo.mintick : na)
+
+if shortSignal and sessionOK and canTrade and strategy.position_size == 0
+    stopLoss = high + atr
+    takeProfit = close - (stopLoss - close) * rrRatio
+
+    strategy.entry('Short', strategy.short)
+    strategy.exit('Short Exit', 'Short', stop = stopLoss, limit = takeProfit, trail_points = trailingStop ? atr * trailATRMult / syminfo.mintick : na, trail_offset = trailingStop ? atr * 0.5 / syminfo.mintick : na)
+
+// Track losses
+if strategy.closedtrades.profit(strategy.closedtrades - 1) < 0 and strategy.closedtrades > strategy.closedtrades[1]
+    dailyLosses := dailyLosses + 1
+    dailyLosses
+
+// === PLOTTING ===
+
+// VWAP
+plot(useVWAP ? vwapValue : na, 'VWAP', color = color.orange, linewidth = 2)
+plot(useVWAP ? vwapUpper : na, 'VWAP Upper', color = color.orange, linewidth = 1, style = plot.style_circles)
+plot(useVWAP ? vwapLower : na, 'VWAP Lower', color = color.orange, linewidth = 1, style = plot.style_circles)
+
+// Volume Profile Levels
+plot(showVALevels ? poc : na, 'POC', color = color.yellow, linewidth = 2, style = plot.style_stepline)
+plot(showVALevels ? vah : na, 'VAH', color = color.red, linewidth = 1, style = plot.style_stepline)
+plot(showVALevels ? val : na, 'VAL', color = color.green, linewidth = 1, style = plot.style_stepline)
+
+// ORB Levels
+plot(useORB and orbDefined ? orbHigh : na, 'ORB High', color = color.teal, linewidth = 1, style = plot.style_stepline)
+plot(useORB and orbDefined ? orbLow : na, 'ORB Low', color = color.teal, linewidth = 1, style = plot.style_stepline)
+
+// Absorption signals
+plotshape(showAbsorption and absorptionUp, 'Buy Absorption', shape.circle, location.belowbar, color = color.new(color.green, 50), size = size.small)
+plotshape(showAbsorption and absorptionDown, 'Sell Absorption', shape.circle, location.abovebar, color = color.new(color.red, 50), size = size.small)
+plotshape(strongAbsorption and close > open, 'Strong Buy Absorption', shape.diamond, location.belowbar, color = color.green, size = size.normal)
+plotshape(strongAbsorption and close < open, 'Strong Sell Absorption', shape.diamond, location.abovebar, color = color.red, size = size.normal)
+
+// Triple-A signals
+plotshape(tripleALongSetup, 'Triple-A Long', shape.triangleup, location.belowbar, color = color.lime, size = size.large)
+plotshape(tripleAShortSetup, 'Triple-A Short', shape.triangledown, location.abovebar, color = color.fuchsia, size = size.large)
+
+// Delta histogram (separate pane)
+hline(0, 'Zero', color = color.gray, linestyle = hline.style_dotted)
+
+// Entry signals
+plotshape(longSignal and canTrade and sessionOK, 'Long Entry', shape.arrowup, location.belowbar, color = color.green, size = size.large, text = 'LONG')
+plotshape(shortSignal and canTrade and sessionOK, 'Short Entry', shape.arrowdown, location.abovebar, color = color.red, size = size.large, text = 'SHORT')
+
+// Session background
+bgcolor(inSession ? color.new(color.blue, 95) : na, title = 'Trading Session')
+
+// Warning when max losses hit
+bgcolor(dailyLosses >= maxDailyLosses ? color.new(color.red, 90) : na, title = 'Max Losses - Stop Trading')
+
+// === INFO TABLE ===
+var table infoTable = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 80), border_width = 1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, 'Fabio Valentini Pro Scalper', text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 0, '', text_color = color.white)
+
+    table.cell(infoTable, 0, 1, 'Delta', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 1, buyersControl ? 'BUYERS ↑' : sellersControl ? 'SELLERS ↓' : 'NEUTRAL', text_color = buyersControl ? color.green : sellersControl ? color.red : color.gray, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 2, 'Absorption', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 2, strongAbsorption ? 'STRONG' : absorption ? 'ACTIVE' : 'NONE', text_color = strongAbsorption ? color.yellow : absorption ? color.orange : color.gray, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 3, 'Phase', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 3, expansion ? 'EXPANSION' : contraction ? 'CONTRACTION' : 'NORMAL', text_color = expansion ? color.lime : contraction ? color.orange : color.gray, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 4, 'Daily Losses', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 4, str.tostring(dailyLosses) + '/' + str.tostring(maxDailyLosses), text_color = dailyLosses >= maxDailyLosses - 1 ? color.red : color.white, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 5, 'POC', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 5, str.tostring(poc, '#.##'), text_color = color.yellow, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 6, 'VAH/VAL', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 6, str.tostring(vah, '#.##') + ' / ' + str.tostring(val, '#.##'), text_color = color.white, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 7, 'Session', text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 7, inSession ? 'ACTIVE' : 'CLOSED', text_color = inSession ? color.green : color.red, text_size = size.tiny)
+
+// === ALERTS ===
+alertcondition(longSignal and canTrade, 'Long Signal', 'Fabio Valentini Pro Scalper: Long Entry Signal')
+alertcondition(shortSignal and canTrade, 'Short Signal', 'Fabio Valentini Pro Scalper: Short Entry Signal')
+alertcondition(strongAbsorption, 'Strong Absorption', 'Strong absorption detected - watch for breakout')
+alertcondition(tripleALongSetup, 'Triple-A Long', 'Triple-A Long Setup: Absorption → Accumulation → Aggression UP')
+alertcondition(tripleAShortSetup, 'Triple-A Short', 'Triple-A Short Setup: Absorption → Accumulation → Aggression DOWN')
+alertcondition(dailyLosses >= maxDailyLosses, 'Max Losses', 'Daily loss limit reached - STOP TRADING')

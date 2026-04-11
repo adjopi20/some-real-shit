@@ -55,7 +55,7 @@ class BacktestEngine:
         
         # Calculate positions and returns
         positions = signals.shift(1)  # Enter position day after signal
-        returns = data['Close'].pct_change()
+        returns = data['close'].pct_change()
         
         # Apply commission costs
         trade_changes = positions.diff().abs()

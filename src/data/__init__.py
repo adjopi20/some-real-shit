@@ -77,3 +77,9 @@ class DataLoader:
             data[column].pct_change(),
             name='returns'
         )
+    
+    @staticmethod
+    def to_lowercase_columns(data: pd.DataFrame) -> pd.DataFrame:
+        """Convert columns to lowercase format expected by strategies"""
+        data.columns = data.columns.str.lower()
+        return data
