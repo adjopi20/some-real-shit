@@ -1,0 +1,11 @@
+# ignore file
+# file.txt
+
+# ignore folder
+/data/
+__pycache__/
+/_archive/
+reports/
+
+# ignore extension
+*.log

@@ -1,5 +1,6 @@
 from collections import deque
 from typing import Deque, Tuple, Dict, Optional, Literal
+import numbers
 
 Event = Tuple[int, float, float, Literal["buy", "sell"]]
 
@@ -9,9 +10,10 @@ class OrderFlowEngine:
         self,
         window_type: Literal["time", "count"] = "time",
         window_size: int = 5,
-        absorption_volume_threshold: float = 2.0,
-        absorption_price_threshold: float = 0.001,
-        baseline_alpha: float = 0.1
+        absorption_volume_threshold: float = 3.5,
+        absorption_price_threshold: float = 0.0006,
+        baseline_alpha: float = 0.3,
+        output_precision: int = 8
     ):
         self.window_type = window_type
         self.window_size = window_size
@@ -37,6 +39,8 @@ class OrderFlowEngine:
         # Data health
         self._last_event_ts = None
         self._stale_threshold = 10_000  # ms
+
+        self.output_precision = output_precision
 
     # =========================
     # WINDOW MANAGEMENT
@@ -108,6 +112,20 @@ class OrderFlowEngine:
     # ABSORPTION
     # =========================
     def _detect_absorption(self, total_volume: float, now_ts: int):
+        """
+        Detects high-volume, low-price-movement conditions.
+
+        Interpretation:
+        - Indicates passive liquidity absorbing aggressive orders.
+        - This is NOT a directional signal.
+
+        Use cases:
+        - Volatility expansion precursor
+        - Exhaustion detection
+        - Market regime classification
+
+        Do NOT use this alone to predict price direction.
+        """
         if len(self._events) < 5 or self._baseline_volume == 0:
             return False
 
@@ -126,17 +144,32 @@ class OrderFlowEngine:
 
         return (
             total_volume > self._baseline_volume * self.absorption_volume_threshold
-            and (price_range / ref_price) < (self.absorption_price_threshold * 2)
+            and (price_range / ref_price) < self.absorption_price_threshold
         )
+    
+    def _round_output(self, output: Dict) -> Dict:
+        return {
+            k: round(float(v), self.output_precision) 
+            if isinstance(v, numbers.Real) and not isinstance(v, bool) 
+            else v
+            for k, v in output.items()
+        }
 
     # =========================
     # MAIN
     # =========================
     def process_event(self, event: Dict) -> Optional[Dict]:
-        ts = event["timestamp"]
-        price = event["price"]
-        qty = event["quantity"]
-        side = event["side"]
+        try:
+            ts = int(event["timestamp"])
+            price = float(event["price"])
+            qty = float(event["quantity"])
+            side = event["side"]
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        # Data integrity check
+        if price <= 0 or qty <= 0:
+            return None
 
         # Stale protection
         if self._last_event_ts and (ts - self._last_event_ts > self._stale_threshold):
@@ -208,7 +241,7 @@ class OrderFlowEngine:
             self._last_baseline_update_ts is not None
         )
 
-        return {
+        return self._round_output({
             "timestamp": ts,
             "price": price,
             "delta": delta,
@@ -216,7 +249,6 @@ class OrderFlowEngine:
             "session_cum_delta": self._session_cum_delta,
             "buy_volume": self._buy_volume,
             "sell_volume": self._sell_volume,
-            "imbalance_ratio": imbalance,
             "pressure": pressure,  # NEW
             "volume_per_sec": volume_per_sec,
             "delta_per_sec": delta_per_sec,
@@ -224,7 +256,7 @@ class OrderFlowEngine:
             "price_range": price_range,
             "absorption": absorption,
             "warm": warm,
-        }
+        })
 
     # =========================
     # RESET
@@ -242,3 +274,4 @@ class OrderFlowEngine:
         self.reset_window()
         self._baseline_volume = 0.0
         self._last_baseline_update_ts = None
+        self._session_cum_delta = 0.0
