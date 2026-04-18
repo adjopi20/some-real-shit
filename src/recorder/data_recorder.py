@@ -11,5 +11,11 @@ class DataRecorder:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, event: Dict) -> None:
+        if not isinstance(event, dict):
+            return
+
+        if not event:
+            return
+
         with self.output_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, separators=(",", ":")) + "\n")

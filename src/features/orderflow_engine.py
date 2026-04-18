@@ -35,9 +35,11 @@ class OrderFlowEngine:
         self._baseline_volume = 0.0
         self._last_baseline_update_ts = None
         self._baseline_max_age_ms = window_size * 1000 * 3
+        self._baseline_update_count = 0
 
         # Data health
         self._last_event_ts = None
+        self._last_event = None
         self._stale_threshold = 10_000  # ms
 
         self.output_precision = output_precision
@@ -90,6 +92,7 @@ class OrderFlowEngine:
             if self._last_baseline_update_ts is None:
                 self._last_baseline_update_ts = now_ts
                 self._baseline_volume = current_volume
+                self._baseline_update_count += 1
                 return
 
             if now_ts - self._last_baseline_update_ts < self.window_size * 1000:
@@ -107,6 +110,7 @@ class OrderFlowEngine:
         else:
             a = self.baseline_alpha
             self._baseline_volume = a * current_volume + (1 - a) * self._baseline_volume
+        self._baseline_update_count += 1
     
     # =========================
     # ABSORPTION
@@ -167,6 +171,14 @@ class OrderFlowEngine:
         except (KeyError, TypeError, ValueError):
             return None
 
+        if self._last_event_ts and ts < self._last_event_ts:
+            return None
+
+        current_event = (ts, price, qty, side)
+        if self._last_event == current_event:
+            return None
+        self._last_event = current_event
+
         # Data integrity check
         if price <= 0 or qty <= 0:
             return None
@@ -213,10 +225,14 @@ class OrderFlowEngine:
 
         if trade_count > 1:
             time_span = (ts - self._events[0][0]) / 1000
-            if time_span > 0:
+            if time_span > 0.001:
                 volume_per_sec = total / time_span
                 delta_per_sec = self._window_cum_delta / time_span
                 trade_intensity = trade_count / time_span
+            else:
+                volume_per_sec = 0.0
+                delta_per_sec = 0.0
+                trade_intensity = 0.0
 
         imbalance = (
             (self._buy_volume - self._sell_volume) / total
@@ -237,8 +253,7 @@ class OrderFlowEngine:
 
         warm = (
             len(self._events) >= 5 and
-            self._baseline_volume > 0 and
-            self._last_baseline_update_ts is not None
+            self._baseline_update_count >= 3
         )
 
         return self._round_output({
@@ -274,4 +289,6 @@ class OrderFlowEngine:
         self.reset_window()
         self._baseline_volume = 0.0
         self._last_baseline_update_ts = None
+        self._baseline_update_count = 0
         self._session_cum_delta = 0.0
+        self._last_event = None

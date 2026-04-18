@@ -2,7 +2,7 @@
 Test script to verify Hyperliquid data fetching functionality
 """
 import pandas as pd
-from src.data.data_loader import DataLoader
+from src.data import DataLoader
 
 
 def test_hyperliquid_data_fetch():

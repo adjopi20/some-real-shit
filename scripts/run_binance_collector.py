@@ -11,8 +11,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.binance_loader import BinanceDataLoader
 from src.recorder.data_recorder import DataRecorder
 from src.features.orderflow_engine import OrderFlowEngine
-from src.features.candle_aggregator import CandleAggregator
-from src.core.dispatcher import Dispatcher
 
 
 
@@ -23,21 +21,20 @@ async def main():
     loader = BinanceDataLoader()
     recorder = DataRecorder(output_path=filename)
     orderflow_engine = OrderFlowEngine(window_type="time", window_size=5)
-    candle_aggregator = CandleAggregator(timeframe="1m")
-    
-    dispatcher = Dispatcher(
-        orderflow_engine=orderflow_engine,
-        candle_aggregator=candle_aggregator,
-        recorder=recorder
-    )
 
     async def handle_event(event: dict):
-        dispatcher.process(event)
+        flow = orderflow_engine.process_event(event)
+
+        if flow and flow.get("warm", False):
+            record = {
+                "ts": event["timestamp"],
+                "flow": flow
+            }
+            await asyncio.to_thread(recorder.record, record)
         print(f"Processed event @ {event['timestamp']}")
 
     async def handle_reconnect():
         orderflow_engine.reset_session()
-        candle_aggregator.reset()
 
     # IMPORTANT:
     # On WebSocket reconnect, call:
