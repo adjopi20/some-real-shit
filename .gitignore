@@ -6,6 +6,7 @@
 __pycache__/
 /_archive/
 reports/
+/storage/
 
 # ignore extension
 *.log
