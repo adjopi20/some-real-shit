@@ -6,6 +6,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional dependency at runtime
+    pq = None
+
 
 WINDOWS = [20, 50, 100]
 GAP = 10
@@ -155,6 +160,115 @@ def load_trades(input_path: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
     df = df.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
 
     return df, stats
+
+
+def load_trades_from_parquet(input_path: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if pq is None:
+        raise ImportError(
+            "pyarrow is required for parquet input. Install pyarrow or use JSONL input."
+        )
+
+    if input_path.is_dir():
+        files = sorted(input_path.glob("*.parquet"))
+    else:
+        files = [input_path] if input_path.suffix.lower() == ".parquet" else []
+
+    if not files:
+        raise ValueError(f"No parquet files found at: {input_path}")
+
+    stats = {
+        "lines_total": 0,
+        "rows_parsed": 0,
+        "rows_bad": 0,
+        "rows_raw": 0,
+        "rows_reconstructed": 0,
+    }
+
+    parsed_frames: List[pd.DataFrame] = []
+
+    for i, fp in enumerate(files, start=1):
+        df = pq.read_table(fp).to_pandas()
+        stats["lines_total"] += len(df)
+
+        required = {"timestamp", "price", "quantity", "side"}
+        if not required.issubset(set(df.columns)):
+            stats["rows_bad"] += len(df)
+            continue
+
+        ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        price = pd.to_numeric(df["price"], errors="coerce")
+        qty = pd.to_numeric(df["quantity"], errors="coerce")
+
+        # Side can be numeric (-1/1) or string (sell/buy).
+        side_num = pd.to_numeric(df["side"], errors="coerce")
+        buy_num = side_num > 0
+        sell_num = side_num < 0
+
+        side_str = df["side"].astype(str).str.lower()
+        buy_str = side_str.eq("buy")
+        sell_str = side_str.eq("sell")
+
+        buy = buy_num | buy_str
+        sell = sell_num | sell_str
+
+        ts_valid = ts.notna() & np.isfinite(ts) & (ts > 0) & (ts % 1 == 0)
+        valid = ts_valid & price.notna() & qty.notna() & (price > 0) & (qty > 0) & (buy | sell)
+
+        stats["rows_bad"] += int((~valid).sum())
+
+        if valid.any():
+            tsv = ts.loc[valid].astype("int64")
+            pv = price.loc[valid].astype("float64")
+            qv = qty.loc[valid].astype("float64")
+            buyv = buy.loc[valid]
+
+            out = pd.DataFrame(
+                {
+                    "timestamp": tsv,
+                    "price": pv,
+                    "quantity": qv,
+                    "side": np.where(buyv, "buy", "sell"),
+                    "delta": np.where(buyv, qv, -qv),
+                    "reconstructed": False,
+                }
+            )
+            parsed_frames.append(out)
+            parsed_n = len(out)
+            stats["rows_parsed"] += parsed_n
+            stats["rows_raw"] += parsed_n
+
+        if i % 1000 == 0:
+            print(f"Loaded parquet files: {i}/{len(files)}")
+
+    if not parsed_frames:
+        raise ValueError("No valid trade rows parsed from parquet input.")
+
+    combined = pd.concat(parsed_frames, ignore_index=True)
+    combined = combined.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    return combined, stats
+
+
+def load_trades_auto(input_path: Path, input_format: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if input_format == "jsonl":
+        return load_trades(input_path)
+
+    if input_format == "parquet":
+        return load_trades_from_parquet(input_path)
+
+    # auto-detect
+    if input_path.is_dir():
+        has_parquet = any(input_path.glob("*.parquet"))
+        if has_parquet:
+            return load_trades_from_parquet(input_path)
+        raise ValueError(
+            f"Auto format detection failed for directory {input_path}. "
+            "Expected parquet files or pass --input-format jsonl with a file path."
+        )
+
+    if input_path.suffix.lower() == ".parquet":
+        return load_trades_from_parquet(input_path)
+
+    return load_trades(input_path)
 
 
 def _causal_tertile_bins(
@@ -435,9 +549,15 @@ def print_validation(df_out: pd.DataFrame, parse_stats: Dict[str, int]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build event-based feature dataset from trade JSONL file."
+        description="Build event-based feature dataset from trade JSONL/parquet input."
     )
-    parser.add_argument("--input", required=True, help="Input JSONL path")
+    parser.add_argument("--input", required=True, help="Input path (JSONL file or parquet file/directory)")
+    parser.add_argument(
+        "--input-format",
+        choices=["auto", "jsonl", "parquet"],
+        default="auto",
+        help="Input format (default: auto)",
+    )
     parser.add_argument(
         "--output",
         default="event_features_dataset.csv",
@@ -451,7 +571,7 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    df_raw, parse_stats = load_trades(input_path)
+    df_raw, parse_stats = load_trades_auto(input_path, args.input_format)
     df_full = build_feature_dataset(df_raw)
 
     rows_before_subsample = len(df_full)
