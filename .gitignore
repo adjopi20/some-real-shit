@@ -6,8 +6,12 @@
 __pycache__/
 /_archive/
 reports/
-/storage/
+# /storage/
 
 # ignore extension
 *.log
 *.csv
+*.parquet
+*.jsonl
+*.jpg
+*.html
